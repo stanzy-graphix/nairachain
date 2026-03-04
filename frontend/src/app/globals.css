@@ -1,0 +1,22 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Syne:wght@400;600;700;800&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { box-sizing: border-box; }
+body { background: #0A0E1A; color: #E8EDF5; font-family: 'DM Mono', 'Courier New', monospace; }
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: #0A0E1A; }
+::-webkit-scrollbar-thumb { background: #1E2D47; border-radius: 2px; }
+
+.fade-in { animation: fadeIn 0.3s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+.ticker-wrap { overflow: hidden; }
+.ticker { animation: ticker 25s linear infinite; display: flex; }
+@keyframes ticker { 0% { transform: translateX(0); } 100% { transform: translateX(-50%); } }
+
+.pulse-dot { animation: pulseDot 2s infinite; }
+@keyframes pulseDot { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+
+.glow-accent { box-shadow: 0 0 24px rgba(0,212,170,0.25); }
