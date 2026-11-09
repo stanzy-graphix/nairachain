@@ -63,12 +63,15 @@ export const Badge = ({ status, className = '' }: { status: string; className?: 
   </span>
 )
 
-export const Stars = ({ rating }: { rating: number }) => (
+export const Stars = ({ rating }: { rating: number }) => {
+  const r = Math.max(0, Math.min(5, Number(rating) || 0))
+  return (
   <span className="text-gold text-xs">
-    {'★'.repeat(Math.floor(rating))}{'☆'.repeat(5 - Math.floor(rating))}
-    <span className="text-muted ml-1">{Number(rating).toFixed(1)}</span>
+    {'★'.repeat(Math.round(r))}{'☆'.repeat(5 - Math.round(r))}
+    <span className="text-muted ml-1">{r ? r.toFixed(1) : 'New'}</span>
   </span>
-)
+  )
+}
 
 export const Spinner = () => (
   <div className="flex items-center justify-center p-8">
@@ -82,5 +85,34 @@ export const EmptyState = ({ icon, title, description, action }: any) => (
     <h3 className="font-display font-bold text-lg mb-2">{title}</h3>
     <p className="text-muted text-sm mb-6 max-w-xs">{description}</p>
     {action}
+  </div>
+)
+
+export const Textarea = ({ label, className = '', ...props }: any) => (
+  <div className="flex flex-col gap-1.5">
+    {label && <label className="text-xs font-semibold tracking-widest text-muted uppercase">{label}</label>}
+    <textarea
+      className={clsx('w-full bg-surface border border-border rounded-lg px-3.5 py-3 text-sm text-text placeholder:text-muted focus:border-accent outline-none transition resize-none', className)}
+      {...props}
+    />
+  </div>
+)
+
+export const Modal = ({ title, onClose, children, className = '' }: { title: string; onClose: () => void; children: React.ReactNode; className?: string }) => (
+  <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" onClick={onClose}>
+    <Card className={clsx('p-7 w-full max-w-md fade-in max-h-[90vh] overflow-y-auto', className)} onClick={(e: React.MouseEvent) => e.stopPropagation()}>
+      <div className="flex justify-between items-center mb-5">
+        <h3 className="font-display font-bold text-lg">{title}</h3>
+        <button onClick={onClose} className="text-muted hover:text-text text-xl" aria-label="Close">✕</button>
+      </div>
+      {children}
+    </Card>
+  </div>
+)
+
+export const Row = ({ k, v, strong = false }: { k: React.ReactNode; v: React.ReactNode; strong?: boolean }) => (
+  <div className="flex justify-between gap-4 py-1.5 border-b border-border/50 text-sm last:border-0">
+    <span className="text-muted">{k}</span>
+    <span className={clsx('text-right break-all', strong ? 'font-semibold' : 'font-medium')}>{v}</span>
   </div>
 )

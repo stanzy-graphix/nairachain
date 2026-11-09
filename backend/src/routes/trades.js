@@ -1,85 +1,124 @@
 const express = require('express');
+const crypto = require('crypto');
+const { body } = require('express-validator');
 const { query, getClient } = require('../db');
 const { authenticate, requireVerified } = require('../middleware/auth');
-const { sendEmail, emailTemplates } = require('../services/email');
-const { body, validationResult } = require('express-validator');
+const { validate } = require('../middleware/validate');
+const { sendEmailSafe, emailTemplates } = require('../services/email');
+const escrow = require('../services/escrow');
 const router = express.Router();
 
 const FEE_RATE = 0.005; // 0.5%
+const timeoutMinutes = () => parseInt(process.env.ESCROW_TIMEOUT_MINUTES || '30', 10);
 
-const generateTradeRef = () => 'TRD-' + Date.now().toString(36).toUpperCase();
+const generateTradeRef = () => 'TRD-' + crypto.randomBytes(5).toString('hex').toUpperCase();
 
-// POST /api/trades - Initiate a trade (buyer accepts offer)
-router.post('/', authenticate, requireVerified, [
-  body('offerId').isUUID(),
-  body('nairaAmount').isFloat({ min: 100 }),
-], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+router.param('ref', (req, res, next, ref) => {
+  if (!/^TRD-[A-Z0-9]{4,16}$/.test(ref)) return res.status(404).json({ error: 'Trade not found' });
+  next();
+});
 
-  const { offerId, nairaAmount } = req.body;
+const emit = (req, trade, event, payload) =>
+  req.app.get('io')?.to(`trade:${trade.id}`).emit(event, { tradeId: trade.id, ...payload });
+
+// Wraps a state-changing handler in a transaction with the trade row locked.
+const withLockedTrade = (handler) => async (req, res) => {
   const client = await getClient();
-
   try {
     await client.query('BEGIN');
+    const { rows } = await client.query('SELECT * FROM trades WHERE trade_ref = $1 FOR UPDATE', [req.params.ref]);
+    const trade = rows[0];
+    if (!trade || (trade.buyer_id !== req.user.id && trade.seller_id !== req.user.id)) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Trade not found' });
+    }
+    const fail = async (status, error) => { await client.query('ROLLBACK'); res.status(status).json({ error }); return null; };
+    const updated = await handler({ req, client, trade, fail });
+    if (!updated) return;
+    await client.query('COMMIT');
+    emit(req, trade, 'trade_status', { status: updated.status });
+    res.json({ trade: updated });
+    return updated;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update trade' });
+  } finally {
+    client.release();
+  }
+};
 
-    // Lock offer row
-    const { rows: offerRows } = await client.query('SELECT * FROM offers WHERE id = $1 AND status = $2 FOR UPDATE', [offerId, 'open']);
+// POST /api/trades - Take an offer and open an escrow-backed trade
+router.post('/', authenticate, requireVerified, [
+  body('offerId').isUUID().withMessage('Invalid offer'),
+  body('nairaAmount').isFloat({ min: 100 }).withMessage('Amount must be at least ₦100').toFloat(),
+  body('bankName').optional({ checkFalsy: true }).isString().trim().isLength({ max: 100 }),
+  body('bankAccountName').optional({ checkFalsy: true }).isString().trim().isLength({ max: 100 }),
+  body('bankAccountNumber').optional({ checkFalsy: true }).matches(/^\d{10}$/).withMessage('Account number must be 10 digits (NUBAN)'),
+], validate, async (req, res) => {
+  const { offerId, nairaAmount } = req.body;
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const { rows: offerRows } = await client.query(`
+      SELECT o.* FROM offers o JOIN users u ON u.id = o.user_id
+      WHERE o.id = $1 AND o.status = 'open' AND u.is_frozen = false FOR UPDATE OF o
+    `, [offerId]);
     const offer = offerRows[0];
-    if (!offer) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Offer not found or not available' }); }
-    if (offer.user_id === req.user.id) { await client.query('ROLLBACK'); return res.status(400).json({ error: "You can't trade with your own offer" }); }
-    if (nairaAmount < offer.min_amount || nairaAmount > offer.max_amount) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: `Amount must be between ₦${offer.min_amount} and ₦${offer.max_amount}` });
+    const fail = async (status, error) => { await client.query('ROLLBACK'); return res.status(status).json({ error }); };
+
+    if (!offer) return fail(404, 'Offer not found or no longer available');
+    if (offer.user_id === req.user.id) return fail(400, "You can't trade with your own offer");
+    if (nairaAmount < parseFloat(offer.min_amount) || nairaAmount > parseFloat(offer.max_amount)) {
+      return fail(400, `Amount must be between ₦${Number(offer.min_amount).toLocaleString()} and ₦${Number(offer.max_amount).toLocaleString()}`);
     }
 
-    const cryptoAmount = parseFloat(nairaAmount) / parseFloat(offer.price_per_unit);
-    const feeAmount = parseFloat(nairaAmount) * FEE_RATE;
-    const buyerId = offer.type === 'sell' ? req.user.id : offer.user_id;
-    const sellerId = offer.type === 'sell' ? offer.user_id : req.user.id;
+    const isSellOffer = offer.type === 'sell';
+    const buyerId = isSellOffer ? req.user.id : offer.user_id;
+    const sellerId = isSellOffer ? offer.user_id : req.user.id;
 
-    // Lock crypto in seller's wallet
-    const { rows: walletRows } = await client.query(
-      'SELECT balance FROM wallets WHERE user_id = $1 AND crypto_type = $2 FOR UPDATE', [sellerId, offer.crypto]);
-    if (!walletRows[0] || parseFloat(walletRows[0].balance) < cryptoAmount) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Seller has insufficient balance' });
+    // Bank account the buyer pays into always belongs to the seller
+    const bank = isSellOffer
+      ? { name: offer.bank_name, accountName: offer.bank_account_name, accountNumber: offer.bank_account_number }
+      : { name: req.body.bankName, accountName: req.body.bankAccountName, accountNumber: req.body.bankAccountNumber };
+    if (!isSellOffer && (!bank.name || !bank.accountName || !bank.accountNumber)) {
+      return fail(400, 'Provide your bank details so the buyer can pay you');
     }
 
-    // Deduct from seller, add to locked
-    await client.query('UPDATE wallets SET balance = balance - $1, locked_balance = locked_balance + $1 WHERE user_id = $2 AND crypto_type = $3',
-      [cryptoAmount, sellerId, offer.crypto]);
+    const cryptoAmount = Number((nairaAmount / parseFloat(offer.price_per_unit)).toFixed(8));
+    const feeAmount = Number((nairaAmount * FEE_RATE).toFixed(2));
 
-    const expiresAt = new Date(Date.now() + parseInt(process.env.ESCROW_TIMEOUT_MINUTES || 30) * 60 * 1000);
+    const locked = await escrow.lock(client, { sellerId, crypto: offer.crypto, amount: cryptoAmount });
+    if (!locked) {
+      return fail(400, isSellOffer ? 'Seller has insufficient balance for this amount' : `You need ${cryptoAmount} ${offer.crypto} available to sell`);
+    }
+
+    const minutes = timeoutMinutes();
     const tradeRef = generateTradeRef();
-
     const { rows: tradeRows } = await client.query(`
-      INSERT INTO trades (trade_ref, offer_id, buyer_id, seller_id, crypto, crypto_amount, naira_amount, price_per_unit, fee_amount, expires_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *
-    `, [tradeRef, offerId, buyerId, sellerId, offer.crypto, cryptoAmount, nairaAmount, offer.price_per_unit, feeAmount, expiresAt]);
+      INSERT INTO trades (trade_ref, offer_id, buyer_id, seller_id, crypto, crypto_amount, naira_amount, price_per_unit, fee_amount,
+        seller_bank_name, seller_bank_account_name, seller_bank_account_number, expires_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW() + make_interval(mins => $13)) RETURNING *
+    `, [tradeRef, offerId, buyerId, sellerId, offer.crypto, cryptoAmount, nairaAmount, offer.price_per_unit, feeAmount,
+        bank.name, bank.accountName, bank.accountNumber, minutes]);
+    const trade = tradeRows[0];
 
-    // Log escrow lock transaction
     await client.query(`INSERT INTO transactions (user_id, trade_id, type, crypto, amount, notes) VALUES ($1, $2, 'escrow_lock', $3, $4, $5)`,
-      [sellerId, tradeRows[0].id, offer.crypto, cryptoAmount, `Escrow locked for trade ${tradeRef}`]);
-
-    // System message
-    await client.query(`INSERT INTO trade_messages (trade_id, sender_id, message, is_system) VALUES ($1, $2, $3, true)`,
-      [tradeRows[0].id, req.user.id, `Trade started. ₦${nairaAmount} for ${cryptoAmount.toFixed(8)} ${offer.crypto}. Buyer should send payment within 30 minutes.`]);
+      [sellerId, trade.id, offer.crypto, cryptoAmount, `Escrow locked for trade ${tradeRef}`]);
+    await escrow.systemMessage(client, trade.id, req.user.id,
+      `Trade started. ₦${nairaAmount.toLocaleString()} for ${cryptoAmount} ${offer.crypto} is locked in escrow. Buyer should send payment within ${minutes} minutes.`);
 
     await client.query('COMMIT');
 
-    // Send email notifications
-    try {
-      const { rows: buyerRows } = await query('SELECT name, email FROM users WHERE id = $1', [buyerId]);
-      const { rows: sellerRows } = await query('SELECT name, email FROM users WHERE id = $1', [sellerId]);
-      const tmpl = emailTemplates.tradeStarted(buyerRows[0].name, tradeRef, cryptoAmount.toFixed(8), offer.crypto);
-      await sendEmail({ to: buyerRows[0].email, ...tmpl });
-      await sendEmail({ to: sellerRows[0].email, subject: `Trade ${tradeRef} - Buyer Incoming`, html: tmpl.html });
-    } catch (e) { console.error('Email error:', e.message); }
+    const { rows: parties } = await query('SELECT id, name, email FROM users WHERE id = ANY($1::uuid[])', [[buyerId, sellerId]]);
+    for (const p of parties) {
+      const role = p.id === buyerId ? 'Buyer' : 'Seller';
+      sendEmailSafe({ to: p.email, ...emailTemplates.tradeStarted(p.name, role, tradeRef, cryptoAmount, offer.crypto, minutes) });
+    }
 
-    res.status(201).json({ trade: tradeRows[0] });
+    res.status(201).json({ trade });
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch(() => {});
     console.error(err);
     res.status(500).json({ error: 'Failed to start trade' });
   } finally {
@@ -87,14 +126,13 @@ router.post('/', authenticate, requireVerified, [
   }
 });
 
-// GET /api/trades - Get user's trades
+// GET /api/trades - Current user's trades
 router.get('/', authenticate, async (req, res) => {
-  const { status, page = 1, limit = 20 } = req.query;
-  const offset = (page - 1) * limit;
+  const limit = Math.min(Number(req.query.limit) || 20, 100);
+  const page = Math.max(Number(req.query.page) || 1, 1);
   try {
     let sql = `
-      SELECT t.*, 
-        buyer.name as buyer_name, buyer.rating as buyer_rating,
+      SELECT t.*, buyer.name as buyer_name, buyer.rating as buyer_rating,
         seller.name as seller_name, seller.rating as seller_rating
       FROM trades t
       JOIN users buyer ON t.buyer_id = buyer.id
@@ -102,24 +140,25 @@ router.get('/', authenticate, async (req, res) => {
       WHERE (t.buyer_id = $1 OR t.seller_id = $1)
     `;
     const params = [req.user.id];
-    if (status) { params.push(status); sql += ` AND t.status = $${params.length}`; }
+    if (req.query.status) { params.push(req.query.status); sql += ` AND t.status = $${params.length}`; }
     sql += ` ORDER BY t.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
-    params.push(limit, offset);
+    params.push(limit, (page - 1) * limit);
     const { rows } = await query(sql, params);
     res.json({ trades: rows });
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: 'Failed to fetch trades' });
   }
 });
 
-// GET /api/trades/:ref - Get single trade
+// GET /api/trades/:ref - Trade detail + chat
 router.get('/:ref', authenticate, async (req, res) => {
   try {
     const { rows } = await query(`
       SELECT t.*,
-        buyer.name as buyer_name, buyer.email as buyer_email, buyer.rating as buyer_rating,
-        seller.name as seller_name, seller.email as seller_email, seller.rating as seller_rating,
-        o.bank_name, o.bank_account_name, o.bank_account_number, o.payment_method
+        buyer.name as buyer_name, buyer.rating as buyer_rating,
+        seller.name as seller_name, seller.rating as seller_rating,
+        o.payment_method, o.terms, o.type as offer_type,
+        EXISTS (SELECT 1 FROM ratings r WHERE r.trade_id = t.id AND r.rater_id = $2) as has_rated
       FROM trades t
       JOIN users buyer ON t.buyer_id = buyer.id
       JOIN users seller ON t.seller_id = seller.id
@@ -128,165 +167,112 @@ router.get('/:ref', authenticate, async (req, res) => {
     `, [req.params.ref, req.user.id]);
     if (!rows[0]) return res.status(404).json({ error: 'Trade not found' });
 
-    // Get messages
     const { rows: messages } = await query(`
       SELECT m.*, u.name as sender_name FROM trade_messages m
       JOIN users u ON m.sender_id = u.id
       WHERE m.trade_id = $1 ORDER BY m.created_at ASC
     `, [rows[0].id]);
 
-    res.json({ trade: rows[0], messages });
-  } catch (err) {
+    res.json({ trade: rows[0], messages, serverTime: new Date() });
+  } catch {
     res.status(500).json({ error: 'Failed to fetch trade' });
   }
 });
 
-// PATCH /api/trades/:ref/payment-sent - Buyer marks payment sent
-router.patch('/:ref/payment-sent', authenticate, async (req, res) => {
-  const client = await getClient();
-  try {
-    await client.query('BEGIN');
-    const { rows } = await client.query('SELECT * FROM trades WHERE trade_ref = $1 FOR UPDATE', [req.params.ref]);
-    const trade = rows[0];
-    if (!trade) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Trade not found' }); }
-    if (trade.buyer_id !== req.user.id) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Only buyer can mark payment sent' }); }
-    if (trade.status !== 'pending_payment') { await client.query('ROLLBACK'); return res.status(400).json({ error: `Trade is ${trade.status}` }); }
-    if (new Date(trade.expires_at) < new Date()) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Trade has expired' }); }
+// PATCH /api/trades/:ref/payment-sent - Buyer marks Naira payment as sent
+router.patch('/:ref/payment-sent', authenticate, withLockedTrade(async ({ req, client, trade, fail }) => {
+  if (trade.buyer_id !== req.user.id) return fail(403, 'Only the buyer can mark payment as sent');
+  if (trade.status !== 'pending_payment') return fail(400, `Trade is already ${trade.status.replace('_', ' ')}`);
+  if (new Date(trade.expires_at) < new Date()) return fail(400, 'Payment window has expired');
 
-    const { rows: updated } = await client.query(`
-      UPDATE trades SET status = 'payment_sent', payment_sent_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING *
-    `, [trade.id]);
+  const { rows } = await client.query(
+    "UPDATE trades SET status = 'payment_sent', payment_sent_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING *", [trade.id]);
+  await escrow.systemMessage(client, trade.id, req.user.id, '💸 Buyer has marked payment as sent. Seller, please confirm receipt in your bank account.');
+  return rows[0];
+}));
 
-    await client.query(`INSERT INTO trade_messages (trade_id, sender_id, message, is_system) VALUES ($1, $2, $3, true)`,
-      [trade.id, req.user.id, 'Buyer has marked payment as sent. Seller please confirm receipt.']);
+// PATCH /api/trades/:ref/confirm-payment - Seller confirms receipt; escrow releases crypto
+router.patch('/:ref/confirm-payment', authenticate, async (req, res, next) => {
+  const updated = await withLockedTrade(async ({ req: r, client, trade, fail }) => {
+    if (trade.seller_id !== r.user.id) return fail(403, 'Only the seller can confirm payment');
+    if (!['payment_sent', 'confirming'].includes(trade.status)) return fail(400, `Cannot confirm a trade that is ${trade.status.replace('_', ' ')}`);
+    return escrow.release(client, trade, r.user.id);
+  })(req, res, next);
 
-    await client.query('COMMIT');
-
-    // Notify via Socket.IO
-    req.app.get('io')?.to(`trade:${trade.id}`).emit('trade_status', { status: 'payment_sent', tradeId: trade.id });
-
-    res.json({ trade: updated[0] });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: 'Failed to update trade' });
-  } finally {
-    client.release();
+  if (updated) {
+    const { rows } = await query('SELECT name, email FROM users WHERE id = ANY($1::uuid[])', [[updated.buyer_id, updated.seller_id]]);
+    for (const p of rows) sendEmailSafe({ to: p.email, ...emailTemplates.tradeCompleted(p.name, updated.trade_ref, updated.crypto_amount, updated.crypto) });
   }
 });
 
-// PATCH /api/trades/:ref/confirm-payment - Seller confirms payment, releases crypto
-router.patch('/:ref/confirm-payment', authenticate, async (req, res) => {
-  const client = await getClient();
-  try {
-    await client.query('BEGIN');
-    const { rows } = await client.query('SELECT * FROM trades WHERE trade_ref = $1 FOR UPDATE', [req.params.ref]);
-    const trade = rows[0];
-    if (!trade) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Trade not found' }); }
-    if (trade.seller_id !== req.user.id) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Only seller can confirm payment' }); }
-    if (!['payment_sent','confirming'].includes(trade.status)) { await client.query('ROLLBACK'); return res.status(400).json({ error: `Cannot confirm at status: ${trade.status}` }); }
+// PATCH /api/trades/:ref/cancel - Buyer cancels before paying; escrow returns to seller
+router.patch('/:ref/cancel', authenticate, withLockedTrade(async ({ req, client, trade, fail }) => {
+  if (trade.buyer_id !== req.user.id) return fail(403, 'Only the buyer can cancel. Sellers can open a dispute instead.');
+  if (trade.status !== 'pending_payment') return fail(400, 'Only trades awaiting payment can be cancelled');
+  return escrow.refund(client, trade, req.user.id, 'Cancelled by buyer');
+}));
 
-    // Release crypto from locked → buyer's wallet
-    await client.query('UPDATE wallets SET locked_balance = locked_balance - $1 WHERE user_id = $2 AND crypto_type = $3',
-      [trade.crypto_amount, trade.seller_id, trade.crypto]);
-    await client.query('UPDATE wallets SET balance = balance + $1 WHERE user_id = $2 AND crypto_type = $3',
-      [trade.crypto_amount, trade.buyer_id, trade.crypto]);
+// PATCH /api/trades/:ref/dispute - Either party escalates to an admin
+router.patch('/:ref/dispute', authenticate, [
+  body('reason').isString().trim().isLength({ min: 10, max: 1000 }).withMessage('Describe the issue (10–1000 characters)'),
+], validate, async (req, res, next) => {
+  const updated = await withLockedTrade(async ({ req: r, client, trade, fail }) => {
+    // Disputes are for when Naira has (supposedly) moved; before that, buyers cancel and expiry handles no-shows
+    if (trade.status !== 'payment_sent') return fail(400, 'Disputes can only be opened after payment is marked as sent');
+    const { rows } = await client.query(
+      "UPDATE trades SET status = 'disputed', dispute_reason = $1, disputed_by = $2, updated_at = NOW() WHERE id = $3 RETURNING *",
+      [r.body.reason, r.user.id, trade.id]);
+    await escrow.systemMessage(client, trade.id, r.user.id, `⚠️ Dispute opened by ${r.user.name}: ${r.body.reason}. Escrow is frozen until an admin resolves it.`);
+    return rows[0];
+  })(req, res, next);
 
-    // Update trade
-    const { rows: updated } = await client.query(`
-      UPDATE trades SET status = 'completed', escrow_status = 'released', payment_confirmed_at = NOW(), updated_at = NOW()
-      WHERE id = $1 RETURNING *
-    `, [trade.id]);
-
-    // Log transactions
-    await client.query(`INSERT INTO transactions (user_id, trade_id, type, crypto, amount, notes) VALUES ($1, $2, 'trade_buy', $3, $4, $5)`,
-      [trade.buyer_id, trade.id, trade.crypto, trade.crypto_amount, `Bought ${trade.crypto_amount} ${trade.crypto}`]);
-    await client.query(`INSERT INTO transactions (user_id, trade_id, type, crypto, amount, notes) VALUES ($1, $2, 'trade_sell', $3, $4, $5)`,
-      [trade.seller_id, trade.id, trade.crypto, trade.crypto_amount, `Sold ${trade.crypto_amount} ${trade.crypto}`]);
-
-    // Update user stats
-    await client.query('UPDATE users SET total_trades = total_trades + 1, successful_trades = successful_trades + 1 WHERE id = $1 OR id = $2',
-      [trade.buyer_id, trade.seller_id]);
-
-    await client.query(`INSERT INTO trade_messages (trade_id, sender_id, message, is_system) VALUES ($1, $2, $3, true)`,
-      [trade.id, req.user.id, `✅ Trade completed! ${trade.crypto_amount} ${trade.crypto} released to buyer.`]);
-
-    await client.query('COMMIT');
-
-    req.app.get('io')?.to(`trade:${trade.id}`).emit('trade_status', { status: 'completed', tradeId: trade.id });
-
-    res.json({ trade: updated[0] });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(err);
-    res.status(500).json({ error: 'Failed to release crypto' });
-  } finally {
-    client.release();
+  if (updated && process.env.ADMIN_EMAIL) {
+    sendEmailSafe({ to: process.env.ADMIN_EMAIL, ...emailTemplates.disputeOpened(updated.trade_ref, req.body.reason) });
   }
 });
 
-// PATCH /api/trades/:ref/dispute - Open dispute
-router.patch('/:ref/dispute', authenticate, [body('reason').isString().isLength({ min: 10 })], async (req, res) => {
-  const { reason } = req.body;
+// POST /api/trades/:ref/message - Chat
+router.post('/:ref/message', authenticate, [
+  body('message').isString().trim().isLength({ min: 1, max: 1000 }).withMessage('Message must be 1–1000 characters'),
+], validate, async (req, res) => {
   try {
-    const { rows } = await query('SELECT * FROM trades WHERE trade_ref = $1', [req.params.ref]);
-    const trade = rows[0];
-    if (!trade) return res.status(404).json({ error: 'Trade not found' });
-    if (trade.buyer_id !== req.user.id && trade.seller_id !== req.user.id) return res.status(403).json({ error: 'Not your trade' });
-    if (!['payment_sent','confirming','pending_payment'].includes(trade.status)) return res.status(400).json({ error: 'Cannot dispute at this stage' });
-
-    const { rows: updated } = await query(`
-      UPDATE trades SET status = 'disputed', dispute_reason = $1, updated_at = NOW() WHERE id = $2 RETURNING *
-    `, [reason, trade.id]);
-
-    await query(`INSERT INTO trade_messages (trade_id, sender_id, message, is_system) VALUES ($1, $2, $3, true)`,
-      [trade.id, req.user.id, `⚠️ Dispute opened: ${reason}`]);
-
-    res.json({ trade: updated[0] });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to open dispute' });
-  }
-});
-
-// POST /api/trades/:ref/message - Send chat message
-router.post('/:ref/message', authenticate, [body('message').isString().isLength({ min: 1, max: 1000 })], async (req, res) => {
-  try {
-    const { rows: tradeRows } = await query('SELECT id, buyer_id, seller_id FROM trades WHERE trade_ref = $1', [req.params.ref]);
+    const { rows: tradeRows } = await query('SELECT id, buyer_id, seller_id, status FROM trades WHERE trade_ref = $1', [req.params.ref]);
     const trade = tradeRows[0];
-    if (!trade) return res.status(404).json({ error: 'Trade not found' });
-    if (trade.buyer_id !== req.user.id && trade.seller_id !== req.user.id) return res.status(403).json({ error: 'Not your trade' });
+    if (!trade || (trade.buyer_id !== req.user.id && trade.seller_id !== req.user.id)) return res.status(404).json({ error: 'Trade not found' });
+    if (['completed', 'cancelled'].includes(trade.status)) return res.status(400).json({ error: 'This trade is closed' });
 
-    const { rows } = await query(`
-      INSERT INTO trade_messages (trade_id, sender_id, message) VALUES ($1, $2, $3) RETURNING *
-    `, [trade.id, req.user.id, req.body.message]);
-
+    const { rows } = await query('INSERT INTO trade_messages (trade_id, sender_id, message) VALUES ($1, $2, $3) RETURNING *',
+      [trade.id, req.user.id, req.body.message]);
     const msg = { ...rows[0], sender_name: req.user.name };
-    req.app.get('io')?.to(`trade:${trade.id}`).emit('new_message', msg);
-
+    emit(req, trade, 'new_message', msg);
     res.status(201).json({ message: msg });
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: 'Failed to send message' });
   }
 });
 
-// POST /api/trades/:ref/rate - Rate trader after completion
-router.post('/:ref/rate', authenticate, [body('score').isInt({ min: 1, max: 5 }), body('comment').optional().isString()], async (req, res) => {
+// POST /api/trades/:ref/rate - Rate counterparty after completion
+router.post('/:ref/rate', authenticate, [
+  body('score').isInt({ min: 1, max: 5 }).withMessage('Score must be 1–5').toInt(),
+  body('comment').optional({ checkFalsy: true }).isString().trim().isLength({ max: 500 }),
+], validate, async (req, res) => {
   const { score, comment } = req.body;
   try {
     const { rows: tradeRows } = await query('SELECT * FROM trades WHERE trade_ref = $1', [req.params.ref]);
     const trade = tradeRows[0];
-    if (!trade || trade.status !== 'completed') return res.status(400).json({ error: 'Trade not completed' });
-    if (trade.buyer_id !== req.user.id && trade.seller_id !== req.user.id) return res.status(403).json({ error: 'Not your trade' });
+    if (!trade || (trade.buyer_id !== req.user.id && trade.seller_id !== req.user.id)) return res.status(404).json({ error: 'Trade not found' });
+    if (trade.status !== 'completed') return res.status(400).json({ error: 'You can only rate completed trades' });
 
     const ratedId = trade.buyer_id === req.user.id ? trade.seller_id : trade.buyer_id;
-    await query('INSERT INTO ratings (trade_id, rater_id, rated_id, score, comment) VALUES ($1, $2, $3, $4, $5)',
-      [trade.id, req.user.id, ratedId, score, comment]);
+    const { rowCount } = await query(`
+      INSERT INTO ratings (trade_id, rater_id, rated_id, score, comment) VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (trade_id, rater_id) DO NOTHING
+    `, [trade.id, req.user.id, ratedId, score, comment || null]);
+    if (!rowCount) return res.status(409).json({ error: 'You already rated this trade' });
 
-    // Recalculate avg rating
-    const { rows } = await query('SELECT AVG(score)::numeric(3,2) as avg FROM ratings WHERE rated_id = $1', [ratedId]);
-    await query('UPDATE users SET rating = $1 WHERE id = $2', [rows[0].avg, ratedId]);
-
+    await query('UPDATE users SET rating = (SELECT AVG(score)::numeric(3,2) FROM ratings WHERE rated_id = $1) WHERE id = $1', [ratedId]);
     res.json({ message: 'Rating submitted' });
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: 'Failed to submit rating' });
   }
 });

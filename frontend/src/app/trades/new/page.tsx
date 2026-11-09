@@ -1,89 +1,83 @@
 'use client'
 import { useState, useEffect, Suspense } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
+import Link from 'next/link'
+import toast from 'react-hot-toast'
 import Navbar from '@/components/Navbar'
-import { Button, Card, Spinner, Stars } from '@/components/ui'
-import { offersAPI, tradesAPI } from '@/lib/api'
+import AuthGuard from '@/components/AuthGuard'
+import { Button, Card, Spinner, Stars, Input, Row } from '@/components/ui'
+import { offersAPI, tradesAPI, walletAPI, apiError } from '@/lib/api'
 import { useAuthStore } from '@/lib/store'
 import { formatNaira, formatCrypto, cryptoIcon } from '@/lib/utils'
-import toast from 'react-hot-toast'
+
+const FEE_RATE = 0.005
 
 function NewTradeContent() {
   const searchParams = useSearchParams()
   const router = useRouter()
-  const { user } = useAuthStore()
-  const offerId = searchParams.get('offer')
+  const user = useAuthStore((s) => s.user)!
+  const offerId = searchParams?.get('offer')
   const [offer, setOffer] = useState<any>(null)
+  const [available, setAvailable] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
   const [amount, setAmount] = useState('')
+  const [bank, setBank] = useState({ bankName: '', bankAccountName: '', bankAccountNumber: '' })
   const [submitting, setSubmitting] = useState(false)
 
   useEffect(() => {
-    if (!offerId) { router.push('/market'); return }
-    offersAPI.get(offerId).then(({ data }) => setOffer(data.offer)).catch(() => {
-      toast.error('Offer not found'); router.push('/market')
-    }).finally(() => setLoading(false))
-  }, [offerId])
+    if (!offerId) { router.replace('/market'); return }
+    offersAPI.get(offerId)
+      .then(async ({ data }) => {
+        setOffer(data.offer)
+        if (data.offer.type === 'buy') {
+          // Taker is selling: show how much they can sell
+          const { data: w } = await walletAPI.getWallets()
+          const wallet = w.wallets.find((x: any) => x.crypto_type === data.offer.crypto)
+          setAvailable(wallet ? parseFloat(wallet.balance) : 0)
+        }
+      })
+      .catch(() => { toast.error('Offer not found'); router.replace('/market') })
+      .finally(() => setLoading(false))
+  }, [offerId, router])
 
-  const cryptoAmount = amount && offer ? (parseFloat(amount) / parseFloat(offer.price_per_unit)) : 0
-  const feeAmount = amount ? parseFloat(amount) * 0.005 : 0
+  if (loading) return <div className="min-h-screen bg-bg"><Navbar /><Spinner /></div>
+  if (!offer) return null
+
+  const isBuying = offer.type === 'sell' // taker buys from a sell offer
+  const naira = parseFloat(amount) || 0
+  const cryptoAmount = naira / parseFloat(offer.price_per_unit)
+  const feeAmount = naira * FEE_RATE
+  const maxBySellerBalance = available !== null ? available * parseFloat(offer.price_per_unit) : Infinity
+  const max = Math.min(parseFloat(offer.max_amount), maxBySellerBalance)
 
   const handleTrade = async () => {
-    if (!user) { router.push('/auth/login'); return }
-    if (!amount || parseFloat(amount) < parseFloat(offer.min_amount)) {
-      toast.error(`Minimum amount is ${formatNaira(offer.min_amount)}`); return
-    }
-    if (parseFloat(amount) > parseFloat(offer.max_amount)) {
-      toast.error(`Maximum amount is ${formatNaira(offer.max_amount)}`); return
-    }
+    if (!user.emailVerified) { toast.error('Verify your email before trading'); return }
+    if (naira < parseFloat(offer.min_amount)) { toast.error(`Minimum amount is ${formatNaira(offer.min_amount)}`); return }
+    if (naira > parseFloat(offer.max_amount)) { toast.error(`Maximum amount is ${formatNaira(offer.max_amount)}`); return }
     setSubmitting(true)
     try {
-      const { data } = await tradesAPI.create({ offerId: offer.id, nairaAmount: parseFloat(amount) })
-      toast.success('Trade started! Escrow locked.')
+      const { data } = await tradesAPI.create({ offerId: offer.id, nairaAmount: naira, ...(isBuying ? {} : bank) })
+      toast.success('Trade started! Crypto is locked in escrow.')
       router.push(`/trades/${data.trade.trade_ref}`)
-    } catch (err: any) {
-      toast.error(err.response?.data?.error || 'Failed to start trade')
+    } catch (err) {
+      toast.error(apiError(err, 'Failed to start trade'))
     } finally {
       setSubmitting(false)
     }
   }
 
-  if (loading) return <div className="min-h-screen bg-bg"><Navbar /><Spinner /></div>
-  if (!offer) return null
-
   return (
     <div className="min-h-screen bg-bg">
       <Navbar />
-      <main className="max-w-lg mx-auto px-6 py-10 fade-in">
-        <button onClick={() => router.back()} className="text-muted text-sm hover:text-accent mb-6 flex items-center gap-1">← Back to Market</button>
+      <main className="max-w-lg mx-auto px-4 md:px-6 py-10 fade-in">
+        <Link href="/market" className="text-muted text-sm hover:text-accent mb-6 inline-flex items-center gap-1">← Back to Market</Link>
 
-        {/* Escrow steps */}
-        <Card className="p-5 mb-5">
-          <div className="text-xs text-muted font-semibold uppercase tracking-wider mb-4">Escrow Protection</div>
-          <div className="flex items-center gap-1">
-            {['Accept', 'Lock Crypto', 'Send ₦', 'Confirm', '✓ Done'].map((s, i) => (
-              <div key={s} className="flex items-center flex-1">
-                <div className="flex flex-col items-center flex-1">
-                  <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${i === 0 ? 'bg-accent text-black' : 'bg-border text-muted'}`}>
-                    {i === 0 ? '1' : i + 1}
-                  </div>
-                  <div className={`text-[10px] mt-1 text-center leading-tight ${i === 0 ? 'text-accent' : 'text-muted'}`}>{s}</div>
-                </div>
-                {i < 4 && <div className="h-0.5 bg-border flex-shrink-0 w-2 mb-4" />}
-              </div>
-            ))}
-          </div>
-        </Card>
-
-        <Card className="p-7">
-          {/* Offer header */}
+        <Card className="p-6 md:p-7">
           <div className="flex justify-between items-start pb-5 mb-5 border-b border-border">
             <div>
-              <h1 className="font-display font-black text-2xl mb-1">
-                {offer.type === 'sell' ? 'Buy' : 'Sell'} {cryptoIcon[offer.crypto]} {offer.crypto}
-              </h1>
-              <div className="text-muted text-sm">with {offer.trader_name}</div>
-              <Stars rating={parseFloat(offer.trader_rating) || 0} />
+              <h1 className="font-display font-black text-2xl mb-1">{isBuying ? 'Buy' : 'Sell'} {cryptoIcon[offer.crypto]} {offer.crypto}</h1>
+              <div className="text-muted text-sm">{isBuying ? 'from' : 'to'} {offer.trader_name}</div>
+              <Stars rating={parseFloat(offer.trader_rating)} />
             </div>
             <div className="text-right">
               <div className="font-display font-black text-2xl text-accent">{formatNaira(offer.price_per_unit)}</div>
@@ -91,46 +85,51 @@ function NewTradeContent() {
             </div>
           </div>
 
-          {/* Limits */}
-          <div className="bg-surface rounded-lg p-3.5 mb-5 text-sm flex justify-between">
-            <span className="text-muted">Limits</span>
-            <span>{formatNaira(offer.min_amount)} – {formatNaira(offer.max_amount)}</span>
+          <div className="bg-surface rounded-lg p-3.5 mb-5">
+            <Row k="Limits" v={`${formatNaira(offer.min_amount)} – ${formatNaira(offer.max_amount)}`} />
+            <Row k="Payment" v={offer.payment_method} />
+            {available !== null && <Row k={`Your ${offer.crypto} balance`} v={formatCrypto(available, offer.crypto)} />}
           </div>
+          {offer.terms && <div className="text-xs text-muted bg-surface rounded-lg p-3.5 mb-5">📝 {offer.terms}</div>}
 
-          {/* Amount input */}
           <div className="mb-5">
-            <label className="text-xs font-semibold text-muted uppercase tracking-wider block mb-2">Amount in Naira (₦)</label>
-            <input
-              type="number" value={amount} onChange={e => setAmount(e.target.value)}
+            <div className="flex justify-between items-end mb-2">
+              <label className="text-xs font-semibold text-muted uppercase tracking-wider">Amount in Naira (₦)</label>
+              {isFinite(max) && max >= parseFloat(offer.min_amount) && (
+                <button type="button" onClick={() => setAmount(String(Math.floor(max)))} className="text-xs text-accent hover:underline">Max</button>
+              )}
+            </div>
+            <input type="number" min={offer.min_amount} max={offer.max_amount} value={amount} onChange={(e) => setAmount(e.target.value)}
               placeholder={`Min: ${formatNaira(offer.min_amount)}`}
-              className="w-full bg-surface border border-border rounded-lg px-4 py-4 text-2xl font-display font-bold text-text focus:border-accent outline-none transition"
-            />
+              className="w-full bg-surface border border-border rounded-lg px-4 py-4 text-2xl font-display font-bold text-text focus:border-accent outline-none transition" />
           </div>
 
-          {/* Summary */}
-          {amount && parseFloat(amount) > 0 && (
-            <div className="bg-surface rounded-lg p-4 mb-5 space-y-2 text-sm">
-              <div className="flex justify-between">
-                <span className="text-muted">You receive</span>
-                <span className="text-accent font-semibold">{formatCrypto(cryptoAmount, offer.crypto)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-muted">Platform fee (0.5%)</span>
-                <span className="text-danger">-{formatNaira(feeAmount)}</span>
-              </div>
-              <div className="flex justify-between border-t border-border pt-2">
-                <span className="font-semibold">Total Naira to send</span>
-                <span className="font-semibold">{formatNaira(amount)}</span>
+          {naira > 0 && (
+            <div className="bg-surface rounded-lg p-4 mb-5 text-sm">
+              <Row k={isBuying ? 'You receive' : 'You send (from escrow)'} v={<span className="text-accent">{formatCrypto(cryptoAmount, offer.crypto)}</span>} />
+              <Row k={isBuying ? 'You pay by bank transfer' : 'You receive by bank transfer'} v={formatNaira(naira)} strong />
+              <Row k="Platform fee (0.5%, recorded on completion)" v={formatNaira(feeAmount)} />
+            </div>
+          )}
+
+          {!isBuying && (
+            <div className="border-t border-border pt-5 mb-5">
+              <p className="text-xs text-muted mb-3 font-semibold uppercase tracking-wider">Your bank details (the buyer pays you here)</p>
+              <div className="flex flex-col gap-3">
+                <Input label="Bank Name" value={bank.bankName} onChange={(e: any) => setBank({ ...bank, bankName: e.target.value })} placeholder="GTBank" />
+                <Input label="Account Name" value={bank.bankAccountName} onChange={(e: any) => setBank({ ...bank, bankAccountName: e.target.value })} placeholder={user.name} />
+                <Input label="Account Number" inputMode="numeric" value={bank.bankAccountNumber} onChange={(e: any) => setBank({ ...bank, bankAccountNumber: e.target.value })} placeholder="0123456789" />
               </div>
             </div>
           )}
 
           <div className="bg-surface rounded-lg p-3.5 mb-5 text-xs text-muted">
-            ⏱ Trade expires in <span className="text-gold font-semibold">30 minutes</span> after you accept. Crypto will be locked in escrow immediately.
+            ⏱ {isBuying ? 'You have' : 'The buyer has'} <span className="text-gold font-semibold">30 minutes</span> to send payment once the trade opens.
+            {isBuying ? " The seller's" : ' Your'} crypto is locked in escrow immediately and released only after the seller confirms payment.
           </div>
 
           <Button onClick={handleTrade} loading={submitting} className="w-full py-4 text-base">
-            Accept Offer & Lock Escrow →
+            {isBuying ? 'Open Trade & Lock Escrow →' : 'Lock My Crypto & Open Trade →'}
           </Button>
         </Card>
       </main>
@@ -139,5 +138,5 @@ function NewTradeContent() {
 }
 
 export default function NewTradePage() {
-  return <Suspense fallback={<Spinner />}><NewTradeContent /></Suspense>
+  return <AuthGuard><Suspense fallback={<Spinner />}><NewTradeContent /></Suspense></AuthGuard>
 }
