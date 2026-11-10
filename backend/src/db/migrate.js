@@ -213,7 +213,7 @@ const migrate = async (pool) => {
 module.exports = { migrate };
 
 if (require.main === module) {
-  const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: require('./index').ssl });
   migrate(pool)
     .then(() => pool.end())
     .catch(() => { pool.end(); process.exit(1); });

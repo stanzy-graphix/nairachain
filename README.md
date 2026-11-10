@@ -11,7 +11,8 @@ A full-stack P2P crypto exchange for Nigeria. Trade Bitcoin, USDT, and Ethereum 
 
 ```
 nairachain/
-├── docker-compose.yml        Local PostgreSQL
+├── docker-compose.yml        Full stack: Postgres + API + web (or just `db`)
+├── .env.example              Secrets/URLs for docker compose
 ├── backend/
 │   ├── src/
 │   │   ├── index.js          Express server, Socket.IO (JWT-authenticated trade rooms), escrow expiry job
@@ -43,7 +44,31 @@ nairachain/
 
 ---
 
-## 🚀 Quick Start (local)
+## 🐳 Run Everything in Docker
+
+The repo ships production images for both apps and a compose file for the full stack (Postgres 16, API, web).
+
+```bash
+cp .env.example .env        # fill in JWT_SECRET and JWT_REFRESH_SECRET
+docker compose up -d --build
+# optional demo data (seed refuses NODE_ENV=production, so override it for this one command):
+docker compose run --rm -e NODE_ENV=development api node src/db/seed.js
+```
+
+Then open http://localhost:3000. The API is at http://localhost:5000 (`/health` reports DB status).
+
+| Image | Details |
+|---|---|
+| `backend/Dockerfile` | `node:22-alpine`, production deps only, runs as `node`, `tini` as PID 1, healthcheck on `/health`. The entrypoint applies the idempotent migration on start (`RUN_MIGRATIONS=false` to skip). |
+| `frontend/Dockerfile` | Multi-stage Next.js `standalone` build, runs as `node`. `NEXT_PUBLIC_API_URL` / `NEXT_PUBLIC_SOCKET_URL` are **build args**, because Next inlines them into the browser bundle. Rebuild the image for each environment's URLs. |
+
+Database SSL is controlled by `DATABASE_SSL=true|false`: it defaults to on when `NODE_ENV=production`, and compose sets it to `false` for its local Postgres. Leave it on for RDS.
+
+**Windows note:** if Docker Desktop won't start (older built-in WSL), Docker Engine inside a WSL2 distro works too: `sudo apt install docker.io docker-buildx docker-compose`, then switch to legacy iptables on older WSL kernels (`sudo update-alternatives --set iptables /usr/sbin/iptables-legacy`), then `sudo service docker start`.
+
+---
+
+## 🚀 Quick Start (local, without Docker for the apps)
 
 Prerequisites: Node.js 18+, and either Docker or PostgreSQL 14+.
 
